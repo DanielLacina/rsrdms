@@ -1,4 +1,5 @@
 use std::fs::{File, OpenOptions};
+use std::io::Seek;
 use std::io::{Read, Result, Write};
 
 const PAGE_SIZE: usize = 8192;
@@ -77,34 +78,32 @@ impl Storage {
         println!("  Higher Pointer: {}", higher);
         println!("  Special Space: {}", special_space);
 
-        // Read pointers (lower section)
         let mut pointers = Vec::new();
         let mut offset = 18;
-        while offset < lower as usize {
-            let tuple_offset = u16::from_le_bytes(page[offset..offset + 2].try_into().unwrap());
-            pointers.push(tuple_offset);
+        while offset < lower {
+            let offset_index = offset as usize;
+            let pointer =
+                u16::from_le_bytes(page[offset_index..(offset_index + 2)].try_into().unwrap());
+            pointers.push(pointer as usize);
             offset += 2;
         }
 
-        println!("\nPointers:");
-        for (index, pointer) in pointers.iter().enumerate() {
-            println!("  Pointer {}: Offset {}", index, pointer);
-        }
-
-        // Read tuple data (higher section)
-        println!("\nTuples:");
         let mut values = Vec::new();
+
         for pointer in pointers {
-            let tuple_start = pointer as usize;
-            let id = page[tuple_start];
-            let offset = tuple_start + 1;
-            let name_length = u16::from_le_bytes(page[offset..offset + 2].try_into().unwrap());
-            let offset = offset + 2;
-            let name_end = offset + name_length as usize;
-            let name = String::from_utf8(page[offset..name_end].to_vec()).unwrap();
+            let (id_start, id_end) = (pointer, pointer + 1);
+            let id = u8::from_le_bytes(page[id_start..id_end].try_into().unwrap());
+            let (name_length_start, name_length_end) = (id_end, id_end + 2);
+            let name_length =
+                u16::from_le_bytes(page[name_length_start..name_length_end].try_into().unwrap());
+            let name = String::from_utf8(
+                page[name_length_end..name_length_end + name_length as usize]
+                    .try_into()
+                    .unwrap(),
+            )
+            .unwrap();
             values.push((id, name));
         }
-
         Ok(values)
     }
 
@@ -143,16 +142,10 @@ impl Storage {
             page[name_length_start..name_length_end].copy_from_slice(&name_length_bytes);
             let (name_start, name_end) = (name_length_end, name_length_end + name_bytes.len());
             page[name_start..name_end].copy_from_slice(&name_bytes);
-            let index =
-                u16::from_le_bytes(page[pointer_start..pointer_end].try_into().unwrap()) as usize;
-            println!(
-                "{}",
-                u16::from_le_bytes(page[index..(index + 2)].try_into().unwrap())
-            );
         }
-        println!("{} {}", lower, higher);
         page[lower_offset_start..lower_offset_end].copy_from_slice(&lower.to_le_bytes());
         page[higher_offset_start..higher_offset_end].copy_from_slice(&higher.to_le_bytes());
+        file.seek(std::io::SeekFrom::Start(0))?;
         file.write_all(&page)?;
         Ok(())
     }
@@ -173,7 +166,6 @@ impl Storage {
         page[14..16].copy_from_slice(&higher.to_le_bytes());
         let special_space: u16 = PAGE_SIZE as u16;
         page[16..18].copy_from_slice(&special_space.to_le_bytes());
-
         file.write_all(&page)?;
         Ok(())
     }
