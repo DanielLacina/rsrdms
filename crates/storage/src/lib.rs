@@ -4,6 +4,27 @@ use std::io::{Read, Result, Write};
 
 const PAGE_SIZE: usize = 8192;
 
+#[derive(Debug, Clone)]
+pub enum DataType {
+    String(String),
+    Integer32(i32),
+    Float32(f32),
+}
+
+#[derive(Debug, PartialEq)]
+struct TableMetadata {
+    pub table_id: u32,
+    pub table_name: String,
+    pub data_file_path: String,
+}
+
+#[derive(Debug)]
+struct ColumnMetadata {
+    pub column_name: String,
+    pub data_type: String,
+    pub is_nullable: bool,
+}
+
 struct HeaderOffsets {
     pub lsn: (usize, usize),
     pub checksum: (usize, usize),
@@ -31,14 +52,10 @@ impl Storage {
         }
     }
 
-    pub fn read_postgres_file(&self, file_path: &str) -> Result<Vec<(u8, String)>> {
-        let mut file = File::open(file_path)?;
+    pub fn read_postgres_class(&self, file_path: &str) -> Result<Vec<TableMetadata>> {
+        let mut file = OpenOptions::new().read(true).write(true).open(file_path)?;
         let mut page = [0u8; PAGE_SIZE];
-
-        // Read the entire page into memory
-        file.read_exact(&mut page)?;
-
-        // Parse header
+        file.read_exact(&mut page)?; // Parse header
         let lsn = u64::from_le_bytes(
             page[self.header_offsets.lsn.0..self.header_offsets.lsn.1]
                 .try_into()
@@ -70,14 +87,6 @@ impl Storage {
                 .unwrap(),
         );
 
-        println!("Header:");
-        println!("  LSN: {}", lsn);
-        println!("  Checksum: {}", checksum);
-        println!("  Flags: {}", flags);
-        println!("  Lower Pointer: {}", lower);
-        println!("  Higher Pointer: {}", higher);
-        println!("  Special Space: {}", special_space);
-
         let mut pointers = Vec::new();
         let mut offset = 18;
         while offset < lower {
@@ -88,26 +97,33 @@ impl Storage {
             offset += 2;
         }
 
-        let mut values = Vec::new();
-
+        let mut tables = Vec::new();
         for pointer in pointers {
-            let (id_start, id_end) = (pointer, pointer + 1);
-            let id = u8::from_le_bytes(page[id_start..id_end].try_into().unwrap());
-            let (name_length_start, name_length_end) = (id_end, id_end + 2);
-            let name_length =
-                u16::from_le_bytes(page[name_length_start..name_length_end].try_into().unwrap());
-            let name = String::from_utf8(
-                page[name_length_end..name_length_end + name_length as usize]
-                    .try_into()
-                    .unwrap(),
-            )
-            .unwrap();
-            values.push((id, name));
+            let (start, end) = (pointer, pointer + 4);
+            let table_id = u32::from_le_bytes(page[start..end].try_into().unwrap());
+            let (start, end) = (end, end + 2);
+            let table_name_length = u16::from_le_bytes(page[start..end].try_into().unwrap());
+            let (start, end) = (end, end + table_name_length as usize);
+            let table_name = String::from_utf8(page[start..end].to_vec()).unwrap();
+            let (start, end) = (end, end + 2);
+            let data_file_path_length = u16::from_le_bytes(page[start..end].try_into().unwrap());
+            let (start, end) = (end, end + data_file_path_length as usize);
+            let data_file_path = String::from_utf8(page[start..end].to_vec()).unwrap();
+            tables.push(TableMetadata {
+                table_id,
+                table_name,
+                data_file_path,
+            });
         }
-        Ok(values)
+        println!("{:?}", tables);
+        Ok(tables)
     }
 
-    pub fn insert_data(&self, file_path: &str, data: &Vec<(u8, String)>) -> Result<()> {
+    pub fn write_postgres_class(
+        &self,
+        file_path: &str,
+        tables_metadata: &Vec<TableMetadata>,
+    ) -> Result<()> {
         let mut file = OpenOptions::new().read(true).write(true).open(file_path)?;
         let mut page = [0u8; PAGE_SIZE];
         file.read_exact(&mut page)?;
@@ -125,35 +141,43 @@ impl Storage {
                 .try_into()
                 .unwrap(),
         );
-        for (id, name) in data {
-            let id_bytes = id.to_le_bytes();
-            let name_bytes = name.as_bytes();
-            let name_length_bytes = (name_bytes.len() as u16).to_le_bytes();
-            let tuple_size: u16 = (id_bytes.len() + 2 + name_bytes.len()) as u16;
-            higher -= tuple_size;
-            let (pointer_start, pointer_end) = (lower as usize, lower as usize + 2);
-            page[pointer_start..pointer_end].copy_from_slice(&(higher).to_le_bytes());
-            // modifies lower and upper bounds
-            lower = pointer_end as u16;
-            //
-            let (id_start, id_end) = (higher as usize, higher as usize + id_bytes.len());
-            page[id_start..id_end].copy_from_slice(&id_bytes);
-            let (name_length_start, name_length_end) = (id_end, id_end + name_length_bytes.len());
-            page[name_length_start..name_length_end].copy_from_slice(&name_length_bytes);
-            let (name_start, name_end) = (name_length_end, name_length_end + name_bytes.len());
-            page[name_start..name_end].copy_from_slice(&name_bytes);
+
+        for table_metadata in tables_metadata {
+            let id_bytes = table_metadata.table_id.to_le_bytes();
+            let table_name_bytes = table_metadata.table_name.as_bytes();
+            let table_name_length_bytes = (table_name_bytes.len() as u16).to_le_bytes();
+            let data_file_path_bytes = table_metadata.data_file_path.as_bytes();
+            let data_file_path_length_bytes = (data_file_path_bytes.len() as u16).to_le_bytes();
+
+            let data_length = id_bytes.len()
+                + table_name_bytes.len()
+                + table_name_length_bytes.len()
+                + data_file_path_bytes.len()
+                + data_file_path_length_bytes.len();
+            higher -= data_length as u16;
+            page[lower as usize..lower as usize + 2].copy_from_slice(&higher.to_le_bytes());
+            lower += 2;
+            let (start, end) = (higher as usize, higher as usize + 4);
+            page[start..end].copy_from_slice(&id_bytes);
+            let (start, end) = (end, end + 2);
+            page[start..end].copy_from_slice(&table_name_length_bytes);
+            let (start, end) = (end, end + table_name_bytes.len());
+            page[start..end].copy_from_slice(&table_name_bytes);
+            let (start, end) = (end, end + 2);
+            page[start..end].copy_from_slice(&data_file_path_length_bytes);
+            let (start, end) = (end, end + data_file_path_bytes.len());
+            page[start..end].copy_from_slice(&data_file_path_bytes);
         }
-        page[lower_offset_start..lower_offset_end].copy_from_slice(&lower.to_le_bytes());
         page[higher_offset_start..higher_offset_end].copy_from_slice(&higher.to_le_bytes());
+        page[lower_offset_start..lower_offset_end].copy_from_slice(&lower.to_le_bytes());
         file.seek(std::io::SeekFrom::Start(0))?;
         file.write_all(&page)?;
         Ok(())
     }
 
-    pub fn create_postgres_file(&self, file_path: &str) -> Result<()> {
+    pub fn create_postgres_class(&self, file_path: &str) -> Result<()> {
         let mut file = File::create(file_path)?;
         let mut page = [0u8; PAGE_SIZE];
-
         let lsn: u64 = 12345678;
         page[0..8].copy_from_slice(&lsn.to_le_bytes());
         let checksum: u16 = 42;
@@ -176,13 +200,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_write_postgres_file() {
+    fn test_write_postgres_class() {
         let storage = Storage::new();
-        let file_path = "src/base/hello".to_string();
-        storage.create_postgres_file(&file_path).unwrap();
-        let data = vec![(1, "bob".to_string()), (2, "bill".to_string())];
-        storage.insert_data(&file_path, &data).unwrap();
-        let values = storage.read_postgres_file(&file_path).unwrap();
-        assert_eq!(values, data);
+        let file_path = "src/base/table".to_string();
+        let tables_metadata = vec![
+            TableMetadata {
+                table_id: 1,
+                table_name: "accounts".to_string(),
+                data_file_path: "src/base/accounts".to_string(),
+            },
+            TableMetadata {
+                table_id: 2,
+                table_name: "users".to_string(),
+                data_file_path: "src/base/users".to_string(),
+            },
+            TableMetadata {
+                table_id: 3,
+                table_name: "orders".to_string(),
+                data_file_path: "src/base/orders".to_string(),
+            },
+            TableMetadata {
+                table_id: 4,
+                table_name: "products".to_string(),
+                data_file_path: "src/base/products".to_string(),
+            },
+            TableMetadata {
+                table_id: 5,
+                table_name: "transactions".to_string(),
+                data_file_path: "src/base/transactions".to_string(),
+            },
+        ];
+        storage.create_postgres_class(&file_path);
+        storage.write_postgres_class(&file_path, &tables_metadata);
+        let read_tables_metadata = storage.read_postgres_class(&file_path).unwrap();
+        assert_eq!(read_tables_metadata, tables_metadata);
     }
 }
