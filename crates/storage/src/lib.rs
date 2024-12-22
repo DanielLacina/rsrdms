@@ -92,7 +92,7 @@ impl Storage {
         file_path: &str,
         entries: Vec<Vec<u8>>,
         calculate_size: F,
-    ) -> Result<()>
+    ) -> Result<Vec<u16>>
     where
         F: Fn(&[u8]) -> usize,
     {
@@ -115,6 +115,7 @@ impl Storage {
                 .unwrap(),
         );
 
+        let mut pointer_offsets = Vec::new();
         for entry in entries {
             let entry_size = calculate_size(&entry);
 
@@ -127,6 +128,7 @@ impl Storage {
 
             higher -= entry_size as u16;
             page[lower as usize..lower as usize + 2].copy_from_slice(&higher.to_le_bytes());
+            pointer_offsets.push(lower);
             lower += 2;
 
             page[higher as usize..higher as usize + entry_size].copy_from_slice(&entry);
@@ -137,7 +139,7 @@ impl Storage {
         file.seek(std::io::SeekFrom::Start(0))?;
         file.write_all(&page)?;
 
-        Ok(())
+        Ok(pointer_offsets)
     }
 
     pub fn read_postgres_class(&self, file_path: &str) -> Result<Vec<TableMetadata>> {
@@ -182,7 +184,8 @@ impl Storage {
             })
             .collect();
 
-        self.write_metadata(file_path, entries, |entry| entry.len())
+        self.write_metadata(file_path, entries, |entry| entry.len());
+        Ok(())
     }
 
     pub fn read_postgres_attribute(&self, file_path: &str) -> Result<Vec<ColumnMetadata>> {
@@ -248,7 +251,11 @@ impl Storage {
             })
             .collect();
 
-        self.write_metadata(file_path, entries, |entry| entry.len())
+        let column_pointer_offsets = self
+            .write_metadata(file_path, entries, |entry| entry.len())
+            .unwrap();
+        self.write_to_table_to_columns_index_file(column_pointer_offsets)?;
+        Ok(())
     }
 
     pub fn create_postgres_file(&self, file_path: &str) -> Result<()> {
@@ -269,6 +276,18 @@ impl Storage {
         file.write_all(&page)?;
         Ok(())
     }
+
+    fn write_to_table_to_columns_index_file(&self, column_pointer_offsets: Vec<u16>) -> Result<()> {
+        let mut data = vec![];
+        for offset in column_pointer_offsets {
+            data.extend_from_slice(&offset.to_le_bytes());
+        }
+        self.write_metadata("src/base/table_to_columns_index", vec![data], |entry| {
+            entry.len()
+        })?;
+
+        Ok(())
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -277,7 +296,9 @@ mod tests {
     #[test]
     fn test_write_postgres_class() {
         let storage = Storage::new();
-        let file_path = "src/base/table".to_string();
+        let tables_to_column_index_file_path = "src/base/table_to_columns_index";
+        storage.create_postgres_file("src/base/table_to_columns_index");
+        let table_file_path = "src/base/table".to_string();
         let columns_metadata = vec![
             ColumnMetadata {
                 column_id: 1,
@@ -330,16 +351,16 @@ mod tests {
                 table_name: "transactions".to_string(),
             },
         ];
-        storage.create_postgres_file(&file_path).unwrap();
+        storage.create_postgres_file(&table_file_path).unwrap();
         storage
-            .write_postgres_class(&file_path, &tables_metadata)
+            .write_postgres_class(&table_file_path, &tables_metadata)
             .unwrap();
         let read_tables_metadata = storage.read_postgres_class(&file_path).unwrap();
         assert_eq!(read_tables_metadata, tables_metadata);
-        let file_path = "src/base/column".to_string();
-        storage.create_postgres_file(&file_path).unwrap();
-        storage.write_postgres_attribute(&file_path, &columns_metadata);
-        let read_columns_metadata = storage.read_postgres_attribute(&file_path).unwrap();
+        let column_file_path = "src/base/column".to_string();
+        storage.create_postgres_file(&column_file_path).unwrap();
+        storage.write_postgres_attribute(&column_file_path, &columns_metadata);
+        let read_columns_metadata = storage.read_postgres_attribute(&column_file_path).unwrap();
         assert_eq!(read_columns_metadata, columns_metadata);
     }
 }
