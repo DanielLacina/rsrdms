@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::Seek;
 use std::io::{Read, Result, Write};
@@ -277,6 +278,8 @@ impl Storage {
         Ok(())
     }
 
+    pub fn get_table_and_columns(&self, table_name: &str) -> Result<()> {}
+
     fn write_to_table_to_columns_index_file(&self, column_pointer_offsets: Vec<u16>) -> Result<()> {
         let mut data = vec![];
         for offset in column_pointer_offsets {
@@ -355,7 +358,7 @@ mod tests {
         storage
             .write_postgres_class(&table_file_path, &tables_metadata)
             .unwrap();
-        let read_tables_metadata = storage.read_postgres_class(&file_path).unwrap();
+        let read_tables_metadata = storage.read_postgres_class(&table_file_path).unwrap();
         assert_eq!(read_tables_metadata, tables_metadata);
         let column_file_path = "src/base/column".to_string();
         storage.create_postgres_file(&column_file_path).unwrap();
